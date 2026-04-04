@@ -3,84 +3,86 @@ const { spawn } = require('child_process');
 
 const PORT = process.env.PORT || 8080;
 const TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+const sessions = new Map();
 
 const server = http.createServer((req, res) => {
-  // Health check
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200);
-    return res.end('ok');
+  const url = new URL(req.url, 'http://localhost');
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    res.writeHead(200); return res.end('ok');
   }
 
-  // SSE endpoint — cada conexion lanza su propio proceso
-  if (req.method === 'GET' && req.url === '/sse') {
+  if (req.method === 'GET' && url.pathname === '/sse') {
+    const sessionId = Math.random().toString(36).slice(2);
+    console.log(`[${sessionId}] New SSE connection`);
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
     });
+
+    res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
 
     const child = spawn('github-mcp-server', ['stdio'], {
       env: { ...process.env, GITHUB_PERSONAL_ACCESS_TOKEN: TOKEN },
     });
 
-    // stdin del child recibe los mensajes POST del cliente
-    req.socket._mcpChild = child;
+    sessions.set(sessionId, { child, res });
 
-    // stdout del child → SSE al cliente
     child.stdout.on('data', (data) => {
-      const lines = data.toString().split('\n').filter(Boolean);
-      for (const line of lines) {
+      data.toString().split('\n').filter(Boolean).forEach(line => {
         res.write(`data: ${line}\n\n`);
-      }
+      });
     });
 
     child.stderr.on('data', (d) => process.stderr.write(d));
 
-    child.on('exit', () => {
-      console.log('Child process exited');
-      res.end();
+    child.on('exit', (code) => {
+      console.log(`[${sessionId}] Child exited (code ${code})`);
+      sessions.delete(sessionId);
+      try { res.end(); } catch {}
     });
 
     req.on('close', () => {
-      console.log('Client disconnected, killing child');
-      child.kill();
+      console.log(`[${sessionId}] Client disconnected`);
+      const s = sessions.get(sessionId);
+      if (s) { s.child.kill(); sessions.delete(sessionId); }
     });
 
     return;
   }
 
-  // Message endpoint — recibe JSON del cliente y lo manda al child via stdin
-  if (req.method === 'POST' && req.url === '/message') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+  if (req.method === 'POST' && url.pathname === '/message') {
+    const sessionId = url.searchParams.get('sessionId');
+    const session = sessions.get(sessionId);
+
+    if (!session || session.child.killed) {
+      res.writeHead(400); return res.end('Session not found');
+    }
+
     let body = '';
-    req.on('data', (chunk) => (body += chunk));
+    req.on('data', c => body += c);
     req.on('end', () => {
-      const child = req.socket._mcpChild;
-      if (child && !child.killed) {
-        child.stdin.write(body + '\n');
-        res.writeHead(200);
-        res.end('ok');
-      } else {
-        res.writeHead(400);
-        res.end('No active SSE session on this socket');
+      try {
+        session.child.stdin.write(body + '\n');
+        res.writeHead(202); res.end('accepted');
+      } catch (e) {
+        res.writeHead(500); res.end('Write failed');
       }
     });
     return;
   }
 
-  // CORS preflight
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST', 'Access-Control-Allow-Headers': 'Content-Type' });
-    return res.end();
-  }
-
-  res.writeHead(404);
-  res.end('Not found');
+  res.writeHead(404); res.end('Not found');
 });
 
 server.listen(PORT, () => {
-  console.log(`MCP SSE server listening on port ${PORT}`);
-  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
-  console.log(`POST endpoint: http://localhost:${PORT}/message`);
+  console.log(`GitHub MCP SSE server on port ${PORT}`);
 });
